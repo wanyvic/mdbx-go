@@ -13016,6 +13016,20 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
   malloc_time = osal_monotime() - malloc_start;
   if (unlikely(txn == nullptr))
     return LOG_IFERR(MDBX_ENOMEM);
+  
+  // Log slow malloc operations (> 500ms)
+  if (malloc_time > 500000000ULL) { // 500ms = 500,000,000ns
+    // Define temporary variables for detailed size breakdown
+    const size_t bitmap_size = (flags & MDBX_TXN_RDONLY) ? (size_t)bitmap_bytes : 0;
+    const size_t dbi_seqs_size = (flags & MDBX_TXN_RDONLY) ? env->max_dbi * sizeof(txn->dbi_seqs[0]) : 0;
+    const size_t dbi_dbs_size = env->max_dbi * sizeof(txn->dbs[0]);
+    const size_t dbi_cursors_size = env->max_dbi * sizeof(txn->cursors[0]);
+    const size_t dbi_state_size = env->max_dbi * sizeof(txn->dbi_state[0]);
+    const size_t dbi_arrays_total = dbi_dbs_size + dbi_cursors_size + dbi_state_size;
+    
+    WARNING("txn_begin_ex SLOW MALLOC: malloc took %" PRIu64 "ms total_size=%zu base=%zu bitmap_size=%zu dbi_seqs=%zu dbi_dbs=%zu dbi_cursors=%zu dbi_state=%zu dbi_arrays_total=%zu max_dbi=%u env=%p", 
+            malloc_time / 1000000, size, base, bitmap_size, dbi_seqs_size, dbi_dbs_size, dbi_cursors_size, dbi_state_size, dbi_arrays_total, env->max_dbi, (void *)env);
+  }
 #if MDBX_DEBUG
   memset(txn, 0xCD, size);
   VALGRIND_MAKE_MEM_UNDEFINED(txn, size);
@@ -13162,8 +13176,8 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
     
     // Only log performance metrics for read-only transactions when total time > 1 second
     if (!parent && (flags & MDBX_TXN_RDONLY) && total_time > 1000000000ULL) {
-      WARNING("txn_begin_ex SLOW: total=%" PRIu64 "ms check_env=%" PRIu64 "ns malloc=%" PRIu64 "ns renew=%" PRIu64 "ns txnid=%" PRIaTXN " flags=0x%x env=%p root=%" PRIaPGNO "/%" PRIaPGNO, 
-              total_time / 1000000, check_env_time, malloc_time, renew_time, txn->txnid, flags, (void *)env, txn->dbs[MAIN_DBI].root, txn->dbs[FREE_DBI].root);
+      WARNING("txn_begin_ex SLOW: total=%" PRIu64 "ms check_env=%" PRIu64 "ns malloc=%" PRIu64 "ns renew=%" PRIu64 "ns txnid=%" PRIaTXN " flags=0x%x env=%p root=%" PRIaPGNO "/%" PRIaPGNO " malloc_size=%zu", 
+              total_time / 1000000, check_env_time, malloc_time, renew_time, txn->txnid, flags, (void *)env, txn->dbs[MAIN_DBI].root, txn->dbs[FREE_DBI].root, size);
     }
 
     DEBUG("begin txn %" PRIaTXN "%c %p on env %p, root page %" PRIaPGNO "/%" PRIaPGNO, txn->txnid,
