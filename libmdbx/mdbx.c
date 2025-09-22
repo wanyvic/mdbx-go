@@ -13017,8 +13017,6 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
   if (unlikely(txn == nullptr))
     return LOG_IFERR(MDBX_ENOMEM);
   
-  // Log slow malloc operations (> 500ms)
-  if (malloc_time > 500000000ULL) { // 500ms = 500,000,000ns
     // Define temporary variables for detailed size breakdown
     const size_t bitmap_size = (flags & MDBX_TXN_RDONLY) ? (size_t)bitmap_bytes : 0;
     const size_t dbi_seqs_size = (flags & MDBX_TXN_RDONLY) ? env->max_dbi * sizeof(txn->dbi_seqs[0]) : 0;
@@ -13026,7 +13024,10 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
     const size_t dbi_cursors_size = env->max_dbi * sizeof(txn->cursors[0]);
     const size_t dbi_state_size = env->max_dbi * sizeof(txn->dbi_state[0]);
     const size_t dbi_arrays_total = dbi_dbs_size + dbi_cursors_size + dbi_state_size;
-    
+    WARNING("txn_begin_ex NORMAL MALLOC: malloc took %" PRIu64 "ms total_size=%zu base=%zu bitmap_size=%zu dbi_seqs=%zu dbi_dbs=%zu dbi_cursors=%zu dbi_state=%zu dbi_arrays_total=%zu max_dbi=%u env=%p", 
+      malloc_time / 1000000, size, base, bitmap_size, dbi_seqs_size, dbi_dbs_size, dbi_cursors_size, dbi_state_size, dbi_arrays_total, env->max_dbi, (void *)env);
+  // Log slow malloc operations (> 500ms)
+  if (malloc_time > 500000000ULL) { // 500ms = 500,000,000ns
     WARNING("txn_begin_ex SLOW MALLOC: malloc took %" PRIu64 "ms total_size=%zu base=%zu bitmap_size=%zu dbi_seqs=%zu dbi_dbs=%zu dbi_cursors=%zu dbi_state=%zu dbi_arrays_total=%zu max_dbi=%u env=%p", 
             malloc_time / 1000000, size, base, bitmap_size, dbi_seqs_size, dbi_dbs_size, dbi_cursors_size, dbi_state_size, dbi_arrays_total, env->max_dbi, (void *)env);
   }
