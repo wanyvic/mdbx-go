@@ -12948,6 +12948,9 @@ int mdbx_txn_set_userctx(MDBX_txn *txn, void *ctx) {
 void *mdbx_txn_get_userctx(const MDBX_txn *txn) { return check_txn(txn, MDBX_TXN_FINISHED) ? nullptr : txn->userctx; }
 
 int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, MDBX_txn **ret, void *context) {
+  const uint64_t start_time = osal_monotime();
+  uint64_t check_env_time = 0, malloc_time = 0, renew_time = 0;
+  
   if (unlikely(!ret))
     return LOG_IFERR(MDBX_EINVAL);
   *ret = nullptr;
@@ -12955,7 +12958,9 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
   if (unlikely((flags & ~txn_rw_begin_flags) && (parent || (flags & ~txn_ro_begin_flags))))
     return LOG_IFERR(MDBX_EINVAL);
 
+  const uint64_t check_env_start = osal_monotime();
   int rc = check_env(env, true);
+  check_env_time = osal_monotime() - check_env_start;
   if (unlikely(rc != MDBX_SUCCESS))
     return LOG_IFERR(rc);
 
@@ -12994,6 +12999,7 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
     goto renew;
   }
 
+  const uint64_t malloc_start = osal_monotime();
   const intptr_t bitmap_bytes =
 #if MDBX_ENABLE_DBI_SPARSE
       ceil_powerof2(env->max_dbi, CHAR_BIT * sizeof(txn->dbi_sparse[0])) / CHAR_BIT;
@@ -13007,6 +13013,7 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
                       ((flags & MDBX_TXN_RDONLY) ? (size_t)bitmap_bytes + env->max_dbi * sizeof(txn->dbi_seqs[0]) : 0) +
                       env->max_dbi * (sizeof(txn->dbs[0]) + sizeof(txn->cursors[0]) + sizeof(txn->dbi_state[0]));
   txn = osal_malloc(size);
+  malloc_time = osal_monotime() - malloc_start;
   if (unlikely(txn == nullptr))
     return LOG_IFERR(MDBX_ENOMEM);
 #if MDBX_DEBUG
@@ -13128,7 +13135,9 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
     txn->dbi_sparse = ptr_disp(txn->dbi_state, -bitmap_bytes);
 #endif /* MDBX_ENABLE_DBI_SPARSE */
   renew:
+    const uint64_t renew_start = osal_monotime();
     rc = txn_renew(txn, flags);
+    renew_time = osal_monotime() - renew_start;
   }
 
   if (unlikely(rc != MDBX_SUCCESS)) {
@@ -13148,10 +13157,19 @@ int mdbx_txn_begin_ex(MDBX_env *env, MDBX_txn *parent, MDBX_txn_flags_t flags, M
     txn->signature = txn_signature;
     txn->userctx = context;
     *ret = txn;
+
+    const uint64_t total_time = osal_monotime() - start_time;
+    
+    // Only log performance metrics for read-only transactions when total time > 1 second
+    if (!parent && (flags & MDBX_TXN_RDONLY) && total_time > 1000000000ULL) {
+      WARNING("txn_begin_ex SLOW: total=%" PRIu64 "ms check_env=%" PRIu64 "ns malloc=%" PRIu64 "ns renew=%" PRIu64 "ns txnid=%" PRIaTXN " flags=0x%x env=%p root=%" PRIaPGNO "/%" PRIaPGNO, 
+              total_time / 1000000, check_env_time, malloc_time, renew_time, txn->txnid, flags, (void *)env, txn->dbs[MAIN_DBI].root, txn->dbs[FREE_DBI].root);
+    }
+
     DEBUG("begin txn %" PRIaTXN "%c %p on env %p, root page %" PRIaPGNO "/%" PRIaPGNO, txn->txnid,
-          (flags & MDBX_TXN_RDONLY) ? 'r' : 'w', (void *)txn, (void *)env, txn->dbs[MAIN_DBI].root,
-          txn->dbs[FREE_DBI].root);
-  }
+      (flags & MDBX_TXN_RDONLY) ? 'r' : 'w', (void *)txn, (void *)env, txn->dbs[MAIN_DBI].root,
+      txn->dbs[FREE_DBI].root);
+}
 
   return LOG_IFERR(rc);
 }
@@ -26909,7 +26927,17 @@ bsr_t mvcc_bind_slot(MDBX_env *env) {
   eASSERT(env, env->lck->magic_and_version == MDBX_LOCK_MAGIC);
   eASSERT(env, env->lck->os_and_format == MDBX_LOCK_FORMAT);
 
+  const uint64_t lock_start = osal_monotime();
   bsr_t result = {lck_rdt_lock(env), nullptr};
+  const uint64_t lock_end = osal_monotime();
+  
+  // Log MVCC lock performance when time > 0.5 seconds
+  const uint64_t lock_time = lock_end - lock_start;
+  if (lock_time > 500000000ULL) {  // 0.5 seconds = 500,000,000 nanoseconds
+    WARNING("mvcc_bind_slot SLOW: lock took %" PRIu64 "ms env=%p", 
+            lock_time / 1000000, (void *)env);
+  }
+  
   if (unlikely(MDBX_IS_ERROR(result.err)))
     return result;
   if (unlikely(env->flags & ENV_FATAL_ERROR)) {
@@ -36326,6 +36354,8 @@ int txn_abort(MDBX_txn *txn) {
 int txn_renew(MDBX_txn *txn, unsigned flags) {
   MDBX_env *const env = txn->env;
   int rc;
+  const uint64_t renew_start = osal_monotime();
+  uint64_t mvcc_bind_time = 0, meta_fetch_time = 0, txn_lock_time = 0, dbi_lock_time = 0, dxb_resize_time = 0, filesize_time = 0, dpl_alloc_time = 0;
 
 #if MDBX_ENV_CHECKPID
   if (unlikely(env->pid != osal_getpid())) {
@@ -36360,7 +36390,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
       if (unlikely(r->pid.weak != env->pid || r->txnid.weak < SAFE64_INVALID_THRESHOLD))
         return MDBX_BAD_RSLOT;
     } else if (env->lck_mmap.lck) {
+      const uint64_t mvcc_bind_start = osal_monotime();
       bsr_t brs = mvcc_bind_slot(env);
+      mvcc_bind_time = osal_monotime() - mvcc_bind_start;
       if (unlikely(brs.err != MDBX_SUCCESS))
         return brs.err;
       r = brs.rslot;
@@ -36387,6 +36419,7 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
     /* Seek & fetch the last meta */
     uint64_t timestamp = 0;
     size_t loop = 0;
+    const uint64_t meta_fetch_start = osal_monotime();
     troika_t troika = meta_tap(env);
     while (1) {
       const meta_ptr_t head = likely(env->stuck_meta < 0) ? /* regular */ meta_recent(env, &troika)
@@ -36444,6 +36477,7 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
         goto retry;
       break;
     }
+    meta_fetch_time = osal_monotime() - meta_fetch_start;
 
     if (unlikely(txn->txnid < MIN_TXNID || txn->txnid > MAX_TXNID)) {
       ERROR("%s", "environment corrupted by died writer, must shutdown!");
@@ -36481,7 +36515,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
 
     /* Not yet touching txn == env->basal_txn, it may be active */
     jitter4testing(false);
+    const uint64_t txn_lock_start = osal_monotime();
     rc = lck_txn_lock(env, !!(flags & MDBX_TXN_TRY));
+    txn_lock_time = osal_monotime() - txn_lock_start;
     if (unlikely(rc))
       return rc;
     if (unlikely(env->flags & ENV_FATAL_ERROR)) {
@@ -36565,7 +36601,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
       else if (rc != MDBX_BUSY && rc != MDBX_EDEADLK)
         goto bailout;
     }
+    const uint64_t dbi_lock_start = osal_monotime();
     rc = osal_fastmutex_acquire(&env->dbi_lock);
+    dbi_lock_time = osal_monotime() - dbi_lock_start;
     if (likely(rc == MDBX_SUCCESS)) {
       /* проверяем повторно после захвата блокировки */
       uint32_t seq = atomic_load32(&env->dbi_seqs[MAIN_DBI], mo_AcquireRelease);
@@ -36631,7 +36669,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
         rc = MDBX_UNABLE_EXTEND_MAPSIZE;
         goto bailout;
       }
+      const uint64_t dxb_resize_start = osal_monotime();
       rc = dxb_resize(env, txn->geo.first_unallocated, txn->geo.end_pgno, txn->geo.upper, implicit_grow);
+      dxb_resize_time = osal_monotime() - dxb_resize_start;
       if (unlikely(rc != MDBX_SUCCESS))
         goto bailout;
       eASSERT(env, env->dxb_mmap.limit >= env->dxb_mmap.current);
@@ -36661,7 +36701,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
 #endif
       if (likely(rc == MDBX_SUCCESS)) {
         eASSERT(env, env->dxb_mmap.limit >= env->dxb_mmap.current);
+        const uint64_t filesize_start = osal_monotime();
         rc = osal_filesize(env->dxb_mmap.fd, &env->dxb_mmap.filesize);
+        filesize_time = osal_monotime() - filesize_start;
         if (likely(rc == MDBX_SUCCESS)) {
           eASSERT(env, env->dxb_mmap.filesize >= required_bytes);
           if (env->dxb_mmap.current > env->dxb_mmap.filesize)
@@ -36700,7 +36742,9 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
       if (env->options.need_dp_limit_adjust)
         env_options_adjust_dp_limit(env);
       if ((txn->flags & MDBX_WRITEMAP) == 0 || MDBX_AVOID_MSYNC) {
+        const uint64_t dpl_alloc_start = osal_monotime();
         rc = dpl_alloc(txn);
+        dpl_alloc_time = osal_monotime() - dpl_alloc_start;
         if (unlikely(rc != MDBX_SUCCESS))
           goto bailout;
         txn->tw.dirtyroom = txn->env->options.dp_limit;
@@ -36720,6 +36764,17 @@ int txn_renew(MDBX_txn *txn, unsigned flags) {
         goto bailout;
     }
     dxb_sanitize_tail(env, txn);
+    
+    // Add performance logging for txn_renew when execution time is high
+    const uint64_t total_time = osal_monotime() - renew_start;
+    if ((flags & MDBX_TXN_RDONLY) && total_time > 1000000000ULL) { // Only for read-only transactions when > 1 second
+      WARNING("txn_renew SLOW: total=%" PRIu64 "ms mvcc_bind=%" PRIu64 "ns meta_fetch=%" PRIu64 "ns txnid=%" PRIaTXN " flags=0x%x env=%p root=%" PRIaPGNO "/%" PRIaPGNO,
+              total_time / 1000000, mvcc_bind_time, meta_fetch_time, txn->txnid, flags, (void *)env, txn->dbs[MAIN_DBI].root, txn->dbs[FREE_DBI].root);
+    } else if (!(flags & MDBX_TXN_RDONLY) && total_time > 1000000000ULL) { // Only for write transactions when > 1 second
+      WARNING("txn_renew SLOW: total=%" PRIu64 "ms txn_lock=%" PRIu64 "ns dbi_lock=%" PRIu64 "ns dxb_resize=%" PRIu64 "ns filesize=%" PRIu64 "ns dpl_alloc=%" PRIu64 "ns txnid=%" PRIaTXN " flags=0x%x env=%p root=%" PRIaPGNO "/%" PRIaPGNO,
+              total_time / 1000000, txn_lock_time, dbi_lock_time, dxb_resize_time, filesize_time, dpl_alloc_time, txn->txnid, flags, (void *)env, txn->dbs[MAIN_DBI].root, txn->dbs[FREE_DBI].root);
+    }
+    
     return MDBX_SUCCESS;
   }
 bailout:
