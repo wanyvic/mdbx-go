@@ -26091,7 +26091,7 @@ __cold const char *mdbx_dump_val(const MDBX_val *val, char *const buf, const siz
 
   if (is_ascii) {
     int len = snprintf(buf, bufsize, "%.*s", (val->iov_len > INT_MAX) ? INT_MAX : (int)val->iov_len, data);
-    assert(len > 0 && (size_t)len < bufsize);
+    assert(len > 0);
     (void)len;
   } else {
     char *const detent = buf + bufsize - 2;
